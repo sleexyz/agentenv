@@ -1,0 +1,121 @@
+#!/bin/bash
+# agentenv — portable dev environments for agents and humans
+# Dev shell in ~2s via APFS COW volume clones + optional personal profile
+set -euo pipefail
+
+VOLUMES_DIR="$HOME/Library/Application Support/com.apple.container/volumes"
+GOLDEN_VOL="nix-golden"
+IMAGE="agentenv"
+TEMP_VOL="agentenv-$$"
+PROFILE_DIR=""
+CONFIG_FILE="$HOME/.config/agentenv/config.toml"
+
+die() { echo "agentenv: $*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+Usage: agentenv [options] [directory]
+
+Options:
+  -p, --profile <dir>   Mount a profile directory (with activate.sh)
+  -h, --help            Show this help
+
+Configuration:
+  ~/.config/agentenv/config.toml
+    profile = "~/config"    # default profile directory
+
+Examples:
+  agentenv .                        # dev shell for current project
+  agentenv --profile ~/config .     # with personal profile
+  agentenv test/basic/              # dev shell for test flake
+EOF
+  exit 0
+}
+
+# --- Parse config file ---
+read_config() {
+  if [ -f "$CONFIG_FILE" ]; then
+    local val
+    val=$(grep -E '^profile\s*=' "$CONFIG_FILE" 2>/dev/null | sed 's/^profile\s*=\s*"\?\(.*\)"\?\s*$/\1/' | sed 's/^~/'"${HOME//\//\\/}"'/' || true)
+    if [ -n "$val" ]; then
+      PROFILE_DIR="$val"
+    fi
+  fi
+}
+
+# --- Parse arguments ---
+read_config
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p|--profile)
+      [ -n "${2:-}" ] || die "missing argument for $1"
+      PROFILE_DIR="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      ;;
+    -*)
+      die "unknown option: $1"
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+# --- Resolve target directory ---
+TARGET_DIR="${1:-.}"
+TARGET_DIR="$(cd "$TARGET_DIR" 2>/dev/null && pwd)" || die "directory not found: ${1:-.}"
+[ -f "$TARGET_DIR/flake.nix" ] || die "no flake.nix in $TARGET_DIR"
+
+# --- Validate profile if specified ---
+if [ -n "$PROFILE_DIR" ]; then
+  _orig_profile="$PROFILE_DIR"
+  PROFILE_DIR="$(cd "$PROFILE_DIR" 2>/dev/null && pwd)" || die "profile directory not found: $_orig_profile"
+  [ -f "$PROFILE_DIR/activate.sh" ] || die "no activate.sh in profile directory: $PROFILE_DIR"
+fi
+
+# --- Cleanup on exit ---
+cleanup() {
+  if container volume list 2>/dev/null | grep -q "^${TEMP_VOL} "; then
+    container volume rm "$TEMP_VOL" 2>/dev/null || true
+  fi
+}
+trap cleanup EXIT INT TERM
+
+# --- Bootstrap golden volume if needed ---
+golden_exists() {
+  container volume list 2>/dev/null | grep -q "^${GOLDEN_VOL} "
+}
+
+bootstrap_golden() {
+  echo "agentenv: bootstrapping golden volume (first-time setup)..."
+  container volume create "$GOLDEN_VOL"
+  container run --rm -v "$GOLDEN_VOL:/nix" "$IMAGE" /bin/sh -c "echo 'agentenv: seed complete.'"
+  echo "agentenv: golden volume ready."
+}
+
+if ! golden_exists; then
+  bootstrap_golden
+fi
+
+# --- Create temp volume + APFS clone ---
+container volume create "$TEMP_VOL" >/dev/null
+rm "$VOLUMES_DIR/$TEMP_VOL/volume.img"
+cp -c "$VOLUMES_DIR/$GOLDEN_VOL/volume.img" "$VOLUMES_DIR/$TEMP_VOL/volume.img"
+
+# --- Build container run command ---
+RUN_ARGS=(-it --rm -v "$TEMP_VOL:/nix" -v "$TARGET_DIR:/work")
+
+if [ -n "$PROFILE_DIR" ]; then
+  RUN_ARGS+=(-v "$PROFILE_DIR:/root/profile" -e "AGENTENV_PROFILE=/root/profile")
+fi
+
+container run "${RUN_ARGS[@]}" "$IMAGE" || true
+
+# --- Promote: clone temp back to golden ---
+cp -c "$VOLUMES_DIR/$TEMP_VOL/volume.img" "$VOLUMES_DIR/$GOLDEN_VOL/volume.img"
+
+# cleanup runs via trap

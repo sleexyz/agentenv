@@ -1,0 +1,4 @@
+*.log
+bashes.log
+progress-*.txt
+.DS_Store
