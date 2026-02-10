@@ -12,6 +12,16 @@ Whether you're spinning up a local container, SSHing into a remote sandbox, or s
 
 ---
 
+## The Bigger Idea
+
+With agentic AI, a development environment is no longer just a passive collection of tools and config files. It becomes something with its own **memory** (what it's learned from past sessions), **agency** (it can act autonomously), **goals** (it knows what you're trying to accomplish), and **tools** (skills, scripts, workflows it's built up over time).
+
+The environment is an active participant in development. It remembers how to debug your codebase. It knows the patterns your team uses. It carries context from project to project. When you dispatch it to a new machine, it doesn't start from zero — it brings everything it's learned.
+
+This is why portability matters beyond just convenience. If your environment has memory and agency, losing it when you switch machines or enter a new container means losing a collaborator. AgentEnv makes environments portable so that this accumulated intelligence follows you — or your agents — everywhere.
+
+---
+
 ## Goals
 
 ### 1. Native Linux dev shells on Mac
