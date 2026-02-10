@@ -15,11 +15,40 @@ if [ -n "${AGENTENV_PROFILE:-}" ] && [ -f "$AGENTENV_PROFILE/activate.sh" ]; the
   /bin/sh "$AGENTENV_PROFILE/activate.sh"
 fi
 
+# Generate wrappers for installed repos
+if [ -d /installed ]; then
+  /busybox mkdir -p /usr/local/bin
+  for repo in /installed/*/; do
+    [ -d "${repo}bin" ] || continue
+    name=$(/busybox basename "$repo")
+    has_flake=false
+    [ -f "${repo}flake.nix" ] && has_flake=true
+
+    for bin in "${repo}bin"/*; do
+      [ -f "$bin" ] && [ -x "$bin" ] || continue
+      cmd=$(/busybox basename "$bin")
+      wrapper="/usr/local/bin/$cmd"
+      if $has_flake; then
+        echo "#!/bin/sh" > "$wrapper"
+        echo "exec nix develop /installed/$name --command /installed/$name/bin/$cmd \"\$@\"" >> "$wrapper"
+      else
+        echo "#!/bin/sh" > "$wrapper"
+        echo "exec /installed/$name/bin/$cmd \"\$@\"" >> "$wrapper"
+      fi
+      /busybox chmod +x "$wrapper"
+    done
+  done
+fi
+
 cd /work
 
-# If arguments were passed, run them directly (now that /nix is populated)
+# If arguments were passed, run them (inside nix develop if flake exists)
 if [ $# -gt 0 ]; then
-  exec "$@"
+  if [ -f /work/flake.nix ]; then
+    exec nix develop --command "$@"
+  else
+    exec "$@"
+  fi
 fi
 
 # Default: enter nix dev shell if flake.nix exists, otherwise interactive bash

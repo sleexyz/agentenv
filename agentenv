@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # agentenv — portable dev environments for agents and humans
 # Dev shell in ~2s via APFS COW volume clones + optional personal profile
 set -euo pipefail
@@ -9,15 +9,27 @@ IMAGE="agentenv"
 TEMP_VOL="agentenv-$$"
 PROFILE_DIR=""
 CONFIG_FILE="$HOME/.config/agentenv/config.toml"
+INSTALLED_DIR="$HOME/.agentenv/installed"
+FORCE_TTY=false
+CMD_ARGS=()
 
 die() { echo "agentenv: $*" >&2; exit 1; }
 
 usage() {
   cat <<EOF
-Usage: agentenv [options] [directory]
+Usage: agentenv [options] [directory] [-- command [args...]]
+       agentenv install [name]
+       agentenv uninstall <name>
+       agentenv list
+
+Commands:
+  install [name]    Install cwd as a mutable repo (name defaults to basename)
+  uninstall <name>  Remove an installed repo
+  list              List installed repos
 
 Options:
   -p, --profile <dir>   Mount a profile directory (with activate.sh)
+  -t                    Force TTY allocation for non-interactive commands
   -h, --help            Show this help
 
 Configuration:
@@ -28,9 +40,63 @@ Examples:
   agentenv .                        # dev shell for current project
   agentenv --profile ~/config .     # with personal profile
   agentenv test/basic/              # dev shell for test flake
+  agentenv . -- make test           # run command, exit with its status
+  agentenv . -- bash -c 'echo $PATH'  # shell pipeline
+  agentenv . -t -- htop             # force TTY for interactive command
+  agentenv install                  # install cwd (name = basename)
+  agentenv install my-tool          # install cwd as "my-tool"
+  agentenv list                     # show installed repos
+  agentenv uninstall my-tool        # remove installation
 EOF
   exit 0
 }
+
+# --- Subcommand: install ---
+cmd_install() {
+  local name="${1:-$(basename "$(pwd)")}"
+  [ -d "$(pwd)" ] || die "current directory is not valid"
+  mkdir -p "$INSTALLED_DIR"
+  ln -sfn "$(pwd)" "$INSTALLED_DIR/$name"
+  echo "agentenv: installed $name → $(pwd)"
+}
+
+# --- Subcommand: uninstall ---
+cmd_uninstall() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: agentenv uninstall <name>"
+  [ -L "$INSTALLED_DIR/$name" ] || die "not installed: $name"
+  rm "$INSTALLED_DIR/$name"
+  echo "agentenv: uninstalled $name"
+}
+
+# --- Subcommand: list ---
+cmd_list() {
+  if [ ! -d "$INSTALLED_DIR" ] || [ -z "$(ls -A "$INSTALLED_DIR" 2>/dev/null)" ]; then
+    echo "agentenv: no repos installed"
+    return
+  fi
+  for link in "$INSTALLED_DIR"/*; do
+    [ -L "$link" ] || continue
+    local name
+    name=$(basename "$link")
+    local target
+    target=$(readlink -f "$link" 2>/dev/null || echo "(broken)")
+    local has_bin="no"
+    local has_flake="no"
+    [ -d "$target/bin" ] && has_bin="yes"
+    [ -f "$target/flake.nix" ] && has_flake="yes"
+    printf "%-20s → %-40s  bin: %-3s  flake: %s\n" "$name" "$target" "$has_bin" "$has_flake"
+  done
+}
+
+# --- Dispatch subcommands ---
+if [ "${1:-}" = "install" ]; then
+  shift; cmd_install "$@"; exit 0
+elif [ "${1:-}" = "uninstall" ]; then
+  shift; cmd_uninstall "$@"; exit 0
+elif [ "${1:-}" = "list" ]; then
+  cmd_list; exit 0
+fi
 
 # --- Parse config file ---
 read_config() {
@@ -53,8 +119,17 @@ while [ $# -gt 0 ]; do
       PROFILE_DIR="$2"
       shift 2
       ;;
+    -t)
+      FORCE_TTY=true
+      shift
+      ;;
     -h|--help)
       usage
+      ;;
+    --)
+      shift
+      CMD_ARGS=("$@")
+      break
       ;;
     -*)
       die "unknown option: $1"
@@ -65,9 +140,24 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# --- Resolve target directory ---
-TARGET_DIR="${1:-.}"
-TARGET_DIR="$(cd "$TARGET_DIR" 2>/dev/null && pwd)" || die "directory not found: ${1:-.}"
+# --- Resolve target directory and command ---
+# If we didn't hit -- yet, the next positional is the directory,
+# then look for -- followed by the command.
+if [ ${#CMD_ARGS[@]} -eq 0 ]; then
+  TARGET_DIR="${1:-.}"
+  shift || true
+  # Check for -- after directory
+  if [ "${1:-}" = "--" ]; then
+    shift
+    CMD_ARGS=("$@")
+  fi
+else
+  # -- was already consumed during option parsing (before directory)
+  # This shouldn't normally happen since directory comes before --
+  TARGET_DIR="."
+fi
+
+TARGET_DIR="$(cd "$TARGET_DIR" 2>/dev/null && pwd)" || die "directory not found: $TARGET_DIR"
 [ -f "$TARGET_DIR/flake.nix" ] || die "no flake.nix in $TARGET_DIR"
 
 # --- Validate profile if specified ---
@@ -107,15 +197,42 @@ rm "$VOLUMES_DIR/$TEMP_VOL/volume.img"
 cp -c "$VOLUMES_DIR/$GOLDEN_VOL/volume.img" "$VOLUMES_DIR/$TEMP_VOL/volume.img"
 
 # --- Build container run command ---
-RUN_ARGS=(-it --rm -v "$TEMP_VOL:/nix" -v "$TARGET_DIR:/work")
+RUN_ARGS=(--rm -v "$TEMP_VOL:/nix" -v "$TARGET_DIR:/work")
+
+# TTY handling: follow Docker's auto-detection model
+if [ ${#CMD_ARGS[@]} -gt 0 ]; then
+  # Command given → non-interactive unless -t forces TTY
+  if [ "$FORCE_TTY" = true ]; then
+    RUN_ARGS+=(-it)
+  fi
+elif [ -t 0 ]; then
+  # No command + stdin is a terminal → interactive
+  RUN_ARGS+=(-it)
+fi
+# Stdin not a terminal + no command → non-interactive (no flags needed)
 
 if [ -n "$PROFILE_DIR" ]; then
   RUN_ARGS+=(-v "$PROFILE_DIR:/root/profile" -e "AGENTENV_PROFILE=/root/profile")
 fi
 
-container run "${RUN_ARGS[@]}" "$IMAGE" || true
+# Mount installed repos
+if [ -d "$INSTALLED_DIR" ]; then
+  for link in "$INSTALLED_DIR"/*; do
+    [ -L "$link" ] || continue
+    name=$(basename "$link")
+    target=$(readlink -f "$link")
+    if [ -d "$target" ]; then
+      RUN_ARGS+=(-v "$target:/installed/$name")
+    fi
+  done
+fi
+
+# Run container and capture exit code
+EXIT_CODE=0
+container run "${RUN_ARGS[@]}" "$IMAGE" "${CMD_ARGS[@]}" || EXIT_CODE=$?
 
 # --- Promote: clone temp back to golden ---
 cp -c "$VOLUMES_DIR/$TEMP_VOL/volume.img" "$VOLUMES_DIR/$GOLDEN_VOL/volume.img"
 
 # cleanup runs via trap
+exit "$EXIT_CODE"
