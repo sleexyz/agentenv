@@ -15,28 +15,48 @@ export HOME=/root
 # Ensure nix profile binaries are on PATH (before shell detection)
 export PATH="$HOME/.nix-profile/bin:$PATH"
 
-# Install personal tools from profile flake (if present)
-# First run: clears base image packages, builds and installs (slow, persists in golden volume)
-# Subsequent runs: no-op (already installed, cached in golden volume)
-if [ -n "${AGENTENV_PROFILE:-}" ] && [ -f "$AGENTENV_PROFILE/flake.nix" ]; then
-  if ! command -v zsh >/dev/null 2>&1; then
-    echo "agentenv: first-time setup — clearing base image packages..."
-    for pkg in bash-interactive coreutils-full curl findutils git-minimal \
-               gnugrep gnutar gzip iana-etc less man-db openssh wget which; do
-      nix profile remove "$pkg" 2>/dev/null || true
-    done
-    echo "agentenv: installing personal tools from profile flake..."
-    if nix profile install "$AGENTENV_PROFILE#portable" 2>&1; then
-      echo "agentenv: personal tools installed."
-    else
-      echo "agentenv: warning: personal tools install failed, continuing without them"
-    fi
-  fi
-fi
+# Install personal tools
+# Supports two modes:
+#   AGENTENV_ENV=1     → environment model: flake.nix is at ~/flake.nix (in the named volume)
+#   AGENTENV_PROFILE   → legacy profile model: flake.nix is at $AGENTENV_PROFILE/flake.nix
+install_personal_tools() {
+  local flake_ref=""
 
-# Activate dotfiles (pure symlinks) if profile is mounted
+  if [ "${AGENTENV_ENV:-}" = "1" ] && [ -f "$HOME/flake.nix" ]; then
+    flake_ref="$HOME"
+  elif [ -n "${AGENTENV_PROFILE:-}" ] && [ -f "$AGENTENV_PROFILE/flake.nix" ]; then
+    flake_ref="$AGENTENV_PROFILE#portable"
+  fi
+
+  [ -n "$flake_ref" ] || return 0
+
+  # Already installed? (check for zsh as sentinel)
+  command -v zsh >/dev/null 2>&1 && return 0
+
+  echo "agentenv: first-time setup — clearing base image packages..."
+  for pkg in bash-interactive coreutils-full curl findutils git-minimal \
+             gnugrep gnutar gzip iana-etc less man-db openssh wget which; do
+    nix profile remove "$pkg" 2>/dev/null || true
+  done
+
+  echo "agentenv: installing personal tools..."
+  if nix profile install "$flake_ref" --no-write-lock-file 2>&1; then
+    echo "agentenv: personal tools installed."
+  else
+    echo "agentenv: warning: personal tools install failed, continuing without them"
+  fi
+}
+
+install_personal_tools
+
+# Activate dotfiles (legacy profile model only)
 if [ -n "${AGENTENV_PROFILE:-}" ] && [ -f "$AGENTENV_PROFILE/activate.sh" ]; then
   . "$AGENTENV_PROFILE/activate.sh"
+fi
+
+# Set ZDOTDIR for environment model (dotfiles are directly in HOME)
+if [ "${AGENTENV_ENV:-}" = "1" ] && [ -d "$HOME/.config/zsh" ]; then
+  export ZDOTDIR="$HOME/.config/zsh"
 fi
 
 # Generate wrappers for installed repos

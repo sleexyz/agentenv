@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # agentenv — portable dev environments for agents and humans
-# Dev shell in ~2s via APFS COW volume clones + optional personal profile
+# Dev shell in ~2s via APFS COW volume clones + persistent home environments
 set -euo pipefail
 
 VOLUMES_DIR="$HOME/Library/Application Support/com.apple.container/volumes"
 GOLDEN_VOL="nix-golden"
+ENV_VOL_PREFIX="agentenv-env-"
 IMAGE="agentenv"
 TEMP_VOL="agentenv-$$"
 PROFILE_DIR="$HOME/config"
@@ -13,6 +14,7 @@ BIN_DIR="$HOME/config/bin"
 SKILLS_DIR="$HOME/config/skills"
 WRAPPER_HEADER="# managed by agentenv install — do not edit"
 FORCE_TTY=false
+ENV_NAME=""
 CMD_ARGS=()
 
 die() { echo "agentenv: $*" >&2; exit 1; }
@@ -20,34 +22,39 @@ die() { echo "agentenv: $*" >&2; exit 1; }
 usage() {
   cat <<EOF
 Usage: agentenv [options] [directory] [-- command [args...]]
+       agentenv env create <name> [directory]
+       agentenv env list
+       agentenv env rm <name>
        agentenv install [name]
        agentenv uninstall <name>
        agentenv list
        agentenv rewrap
 
 Commands:
-  install [name]    Install cwd as a mutable repo (name defaults to basename)
-  uninstall <name>  Remove an installed repo and its wrappers/skills
-  list              List installed repos
-  rewrap            Regenerate all host wrappers and skill links
+  env create <name> [dir]  Create environment from directory (copied into named volume)
+  env list                 List environments
+  env rm <name>            Delete an environment
+  install [name]           Install cwd as a mutable repo (name defaults to basename)
+  uninstall <name>         Remove an installed repo and its wrappers/skills
+  list                     List installed repos
+  rewrap                   Regenerate all host wrappers and skill links
 
 Options:
-  -p, --profile <dir>   Override profile directory (default: ~/config)
-  --no-profile          Launch without profile
-  -t                    Force TTY allocation for non-interactive commands
-  -h, --help            Show this help
+  --env <name>            Use a persistent environment (named volume as HOME)
+  -p, --profile <dir>    Override profile directory (default: ~/config)
+  --no-profile            Launch without profile
+  -t                      Force TTY allocation for non-interactive commands
+  -h, --help              Show this help
 
 Examples:
+  agentenv --env work .             # dev shell with persistent environment
   agentenv .                        # dev shell with personal profile
-  agentenv test/basic/              # dev shell for test flake
+  agentenv env create work ./my-env # create environment from directory
+  agentenv env list                 # list environments
+  agentenv env rm work              # delete environment
   agentenv . -- make test           # run command, exit with its status
-  agentenv . -- bash -c 'echo \$PATH'  # shell pipeline
-  agentenv . -t -- htop             # force TTY for interactive command
   agentenv install                  # install cwd (name = basename)
-  agentenv install my-tool          # install cwd as "my-tool"
   agentenv list                     # show installed repos
-  agentenv uninstall my-tool        # remove installation
-  agentenv rewrap                   # regenerate all wrappers + skill links
 EOF
   exit 0
 }
@@ -263,8 +270,84 @@ cmd_rewrap() {
   done
 }
 
+# --- Environment management ---
+
+env_vol_name() { echo "${ENV_VOL_PREFIX}$1"; }
+
+env_vol_exists() {
+  container volume list 2>/dev/null | grep -q "^$(env_vol_name "$1") "
+}
+
+cmd_env_create() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: agentenv env create <name> [directory]"
+  local src_dir="${2:-}"
+
+  if env_vol_exists "$name"; then
+    die "environment already exists: $name (use 'agentenv env rm $name' first)"
+  fi
+
+  local vol
+  vol=$(env_vol_name "$name")
+
+  echo "agentenv: creating environment '$name'..."
+  container volume create "$vol"
+
+  if [ -n "$src_dir" ]; then
+    src_dir="$(cd "$src_dir" 2>/dev/null && pwd)" || die "directory not found: $src_dir"
+
+    # Boot a temp container to copy files into the volume
+    echo "agentenv: copying $src_dir into environment..."
+    container run --rm -v "$vol:/mnt/env" -v "$src_dir:/mnt/src" "$IMAGE" \
+      /busybox sh -c '/busybox cp -a /mnt/src/. /mnt/env/'
+  fi
+
+  echo "agentenv: environment '$name' created."
+}
+
+cmd_env_list() {
+  local found=false
+  while IFS= read -r line; do
+    local vol_name
+    vol_name=$(echo "$line" | awk '{print $1}')
+    case "$vol_name" in
+      ${ENV_VOL_PREFIX}*)
+        local env_name="${vol_name#$ENV_VOL_PREFIX}"
+        printf "  %s\n" "$env_name"
+        found=true
+        ;;
+    esac
+  done < <(container volume list 2>/dev/null)
+  if ! $found; then
+    echo "agentenv: no environments"
+  fi
+}
+
+cmd_env_rm() {
+  local name="${1:-}"
+  [ -n "$name" ] || die "usage: agentenv env rm <name>"
+  env_vol_exists "$name" || die "environment not found: $name"
+
+  local vol
+  vol=$(env_vol_name "$name")
+  container volume rm "$vol"
+  echo "agentenv: environment '$name' deleted."
+}
+
+cmd_env() {
+  local subcmd="${1:-}"
+  shift || true
+  case "$subcmd" in
+    create) cmd_env_create "$@" ;;
+    list)   cmd_env_list ;;
+    rm)     cmd_env_rm "$@" ;;
+    *)      die "usage: agentenv env {create|list|rm}" ;;
+  esac
+}
+
 # --- Dispatch subcommands ---
 case "${1:-}" in
+  env)       shift; cmd_env "$@"; exit 0 ;;
   install)   shift; cmd_install "$@"; exit 0 ;;
   uninstall) shift; cmd_uninstall "$@"; exit 0 ;;
   list)      cmd_list; exit 0 ;;
@@ -276,6 +359,11 @@ esac
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    --env)
+      [ -n "${2:-}" ] || die "missing argument for --env"
+      ENV_NAME="$2"
+      shift 2
+      ;;
     -p|--profile)
       [ -n "${2:-}" ] || die "missing argument for $1"
       PROFILE_DIR="$2"
@@ -326,8 +414,12 @@ fi
 TARGET_DIR="$(cd "$TARGET_DIR" 2>/dev/null && pwd)" || die "directory not found: $TARGET_DIR"
 [ -f "$TARGET_DIR/flake.nix" ] || die "no flake.nix in $TARGET_DIR"
 
-# --- Validate profile if specified ---
-if [ -n "$PROFILE_DIR" ]; then
+# --- Validate environment or profile ---
+if [ -n "$ENV_NAME" ]; then
+  # --env takes precedence: disable profile
+  env_vol_exists "$ENV_NAME" || die "environment not found: $ENV_NAME (create with 'agentenv env create $ENV_NAME')"
+  PROFILE_DIR=""
+elif [ -n "$PROFILE_DIR" ]; then
   _orig_profile="$PROFILE_DIR"
   PROFILE_DIR="$(cd "$PROFILE_DIR" 2>/dev/null && pwd)" || die "profile directory not found: $_orig_profile"
   [ -f "$PROFILE_DIR/activate.sh" ] || die "no activate.sh in profile directory: $PROFILE_DIR"
@@ -377,7 +469,9 @@ elif [ -t 0 ]; then
 fi
 # Stdin not a terminal + no command → non-interactive (no flags needed)
 
-if [ -n "$PROFILE_DIR" ]; then
+if [ -n "$ENV_NAME" ]; then
+  RUN_ARGS+=(-v "$(env_vol_name "$ENV_NAME"):/root" -e "AGENTENV_ENV=1")
+elif [ -n "$PROFILE_DIR" ]; then
   RUN_ARGS+=(-v "$PROFILE_DIR:/root/profile" -e "AGENTENV_PROFILE=/root/profile")
 fi
 

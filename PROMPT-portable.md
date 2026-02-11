@@ -1,153 +1,188 @@
-# Portable Dev Environment — Layered Primitives
+# Environments — Persistent Home Directories
 
 ## Context
 
-**Goal:** `agentenv .` boots a container with three independent layers: project devshell (packages from project flake), personal tools (zsh, neovim, etc. via nix profile), and dev environment (dotfiles, skills via VirtioFS mount). Each layer is optional. Clean separation.
+**Goal:** `agentenv env create test ./test-env` creates a named volume from a template directory. `agentenv --env test .` boots a container with that volume mounted as HOME. Dotfiles, tools, and state all live in the environment. Verify it works across multiple projects.
 
-**Why it matters:** The current implementation tangles package management and dotfile management. We tried to use home-manager inside the container to do both, and it's fighting the grain. The right design: nix store holds packages (both project and personal), dev environment is just files.
+**Why it matters:** The current design tangles host config with container home. Environments are the real primitive — self-contained, persistent, swappable home directories as named volumes. The environment repo IS the home template: dotfiles + a `flake.nix` for personal tools.
 
-**Spec:** `specs-portable/ontology.md` — defines the three primitives and how they compose.
+**Spec:** `specs/persistent-home.md`
+
+### How it works
+
+```
+test-env/                        ← the template (a directory that looks like a home)
+  flake.nix                      ← declares personal tools (buildEnv)
+  .config/nvim/init.vim          ← editor config
+  .config/zsh/.zshrc             ← shell config
+  .config/zsh/.zshenv
+  .config/git/ignore
+  .tmux.conf                     ← tmux config
+
+agentenv env create test ./test-env
+  1. container volume create agentenv-env-test
+  2. Boot temp container with volume + template mounted
+  3. Copy template contents into the volume
+  → Named volume now has dotfiles + flake.nix
+
+agentenv --env test .
+  1. COW clone golden volume → /nix
+  2. Mount agentenv-env-test → /root
+  3. Mount project → /work
+  4. Entrypoint:
+     a. If ~/flake.nix exists and tools not installed: nix profile install
+     b. nix develop /work --command zsh
+  5. On exit: promote golden volume
+```
 
 ### Key files
 
-| File | Repo | Purpose |
-|------|------|---------|
-| `image/entrypoint.sh` | agentenv | Container boot: seed nix, install personal tools, activate profile, launch shell |
-| `agentenv` | agentenv | Host-side launcher: mounts, volumes, container run |
-| `activate.sh` | config | Symlinks dotfiles + skills into place. Pure symlinks, no nix. |
-| `flake.nix` | config | Exports `packages.aarch64-linux.portable` — personal tools as buildEnv |
-| `nixpkgs/portable.nix` | config | REMOVED — was home-manager module, replaced by buildEnv in flake.nix |
+| File | Purpose |
+|------|---------|
+| `agentenv` | Add `env create/list/rm` subcommands + `--env` flag |
+| `image/entrypoint.sh` | Simplify: check ~/flake.nix, install tools, launch shell. No profile/activate.sh. |
+| `test-env/flake.nix` | Test environment: personal tools (zsh, neovim, tmux, ripgrep, etc.) |
+| `test-env/.config/zsh/.zshrc` | Standalone zsh config |
+| `test-env/.config/zsh/.zshenv` | EDITOR, ZDOTDIR |
+| `test-env/.tmux.conf` | Standalone tmux config |
+| `test-env/.config/nvim/init.vim` | Basic nvim config |
+| `test-env/.config/git/ignore` | Git global ignore |
 
-### What exists and works
+### What exists
 
-- agentenv mounts `~/config` at `/root/profile` (VirtioFS), sets `AGENTENV_PROFILE`
-- agentenv mounts project at `/work` (VirtioFS)
-- Golden volume at `/nix`, APFS COW cloned, promoted on exit
-- `nix develop` inside the container includes `~/.nix-profile/bin` in PATH
-- `--no-profile` flag disables profile mounting
+- `agentenv` script with container launch, volume management, golden volume COW
+- `container` CLI (apple/container) for volumes and container run
+- Existing entrypoint.sh with nix seeding, personal tools install, activate.sh sourcing
+- Standalone dotfiles already written in `~/config/.config/zsh/`, `~/config/.tmux.conf` (from previous session — use as reference)
 
-### What needs to change
+### Constraints
 
-- **activate.sh:** Strip out all nix commands. Pure symlinks only.
-- **flake.nix:** Replace `homeConfigurations.portable` with `packages.aarch64-linux.portable` (simple `buildEnv`)
-- **portable.nix:** Remove (no longer needed — package list is inline in flake.nix)
-- **entrypoint.sh:** Handle personal tools install (`nix profile install` from profile flake if present). Separate concern from dotfile activation.
-- **entrypoint.sh:** Ensure PATH includes `~/.nix-profile/bin` before checking for zsh
+- Container is aarch64-linux, host is aarch64-darwin
+- Container runs as root, HOME=/root
+- Named volumes are ext4 images managed by `container volume`
+- To copy files into a volume, must boot a container with it mounted
+- All nix flake operations require files to be git-tracked (but inside the volume, there's no git — the flake.nix is just a file)
+- The `nix profile install` inside the container uses the flake.nix that was copied into the volume — this is NOT a git repo, so we may need `--no-write-lock-file` or to handle this
+- Previous entrypoint cleared base image packages before installing personal tools — keep this
 
 ---
 
 ## State
 
-**Progress:** Core implementation complete. All "Current Focus" and "Verify" tasks done.
+**Progress:** All current focus and verify tasks complete. Ready for commit.
 
-**What was done:**
-- `flake.nix`: Replaced `homeConfigurations.portable` with `packages.aarch64-linux.portable` (buildEnv)
-- `nixpkgs/portable.nix`: Removed
-- `activate.sh`: Rewritten as pure symlinks (no nix commands)
-- Standalone dotfiles: `.config/zsh/.zshrc`, `.config/zsh/.zshenv`, `.tmux.conf`
-- `entrypoint.sh`: Clears base image packages, installs personal tools via `nix profile install`, then sources activate.sh
+**Current understanding:**
+- An environment repo is just a directory that looks like a home — dotfiles + flake.nix
+- `agentenv env create` copies it into a named volume via temp container
+- `agentenv --env` mounts that volume as /root and sets `AGENTENV_ENV=1`
+- The entrypoint installs tools from ~/flake.nix on first boot (with `--no-write-lock-file` for non-git dirs)
+- The golden volume caches nix store across boots — second boot skips install
+- Backward compat: `AGENTENV_PROFILE` path still works for legacy profile model
 
-**Commits:**
-- config: `9a4441e` — feat: portable profile — standalone dotfiles, buildEnv personal tools
-- agentenv: `abd6696` — feat: entrypoint installs personal tools via nix profile
-
-**Boot performance:**
-- First boot: ~3-4 min (downloads ~134 MiB, builds buildEnv)
-- Second boot: ~2.8s (cached in golden volume)
+**Last iteration:** All implementation complete. env create/list/rm work. --env flag mounts named volume at /root. Entrypoint handles both env and legacy profile models. Persistence verified. Cross-project verified.
 
 ---
 
 ## Predictions
 
-- [ ] A simple `buildEnv` output in ~/config/flake.nix will install cleanly via `nix profile install` inside the container (no home-manager, no activation dance)
-- [ ] `nix develop /work --command zsh` will find zsh from the nix profile without explicit PATH manipulation in the entrypoint
-- [ ] The golden volume promotion will cache the personal tools profile, making second boot fast (no rebuild)
-- [ ] activate.sh as pure symlinks will be trivially reliable — no failure modes from nix/home-manager
-- [ ] The `git-minimal` issue from the previous session won't affect `nix profile install` of a simple buildEnv (no home-manager activation script)
+- [x] Copying a flake directory into a named volume and then `nix profile install ~/flake.nix` from inside the container will work (flake in a non-git directory may need special handling)
+- [x] The golden volume will correctly cache personal tools installed from the environment's flake, making second boot fast
+- [x] The same environment (named volume) can be used across different project directories — `agentenv --env test ~/project-a` then `agentenv --env test ~/project-b` both see the same home
+- [x] Shell history and zoxide database will persist across container reboots (since /root is a persistent volume)
+- [x] The entrypoint simplification (no profile/activate.sh) won't break anything because the environment volume already has dotfiles in the right places
 
 ---
 
 ## Prediction Outcomes
 
-- [x] **buildEnv installs cleanly** — YES, after two fixes: (1) must include `coreutils` in the buildEnv (base image packages get cleared), (2) nix attribute names use camelCase (`bashInteractive` not `bash-interactive`)
-- [x] **nix develop finds zsh from nix profile** — YES, `~/.nix-profile/bin` is already on the nix develop PATH. Adding `export PATH="$HOME/.nix-profile/bin:$PATH"` in the entrypoint ensures it's available even before `nix develop`.
-- [x] **Golden volume caches personal tools** — YES, second boot is 2.8s. `nix profile install` is skipped entirely (checked via `command -v zsh`).
-- [x] **activate.sh as pure symlinks is reliable** — YES, trivially reliable. All symlinks work. Only caveat: must run AFTER personal tools install (otherwise `mkdir`/`ln` aren't available since base packages were cleared).
-- [x] **git-minimal issue doesn't affect buildEnv** — YES, no home-manager activation script = no git dependency issue. `nix profile remove git-minimal` runs cleanly, then our buildEnv provides full `git`.
+All predictions confirmed:
+- Flake in non-git directory works with `--no-write-lock-file` flag on `nix profile install`
+- Golden volume caches tools — second boot skips install entirely (sentinel: `command -v zsh`)
+- Same env volume mounts at /root for any project — verified file persistence across two different project mounts
+- File written in one session readable in next session (named volume is persistent)
+- Environment ZDOTDIR, EDITOR, LANG all loaded correctly from dotfiles in the volume
 
 ---
 
 ## Discoveries
 
-1. **buildEnv must include coreutils** — The entrypoint clears base image packages (coreutils-full, findutils, etc.) to avoid conflicts. The personal tools buildEnv must replace them. Without coreutils, basic commands like `mkdir`, `ln`, `ls` disappear.
-
-2. **Nix attribute names are camelCase** — `bash-interactive` doesn't work in `with pkgs;` context. Must use `bashInteractive`. Hyphens in nix attribute names require `pkgs."bash-interactive"` quoting, but the nixpkgs convention is camelCase for most packages.
-
-3. **Entrypoint ordering matters** — Must: (1) clear base packages, (2) install personal tools, (3) run activate.sh. If activate.sh runs before personal tools are installed, it fails because `mkdir`/`ln` are gone.
-
-4. **`--no-profile` still has personal tools** — Since personal tools live in the golden volume's nix profile, they persist across all boots regardless of `--no-profile`. This is correct per the ontology (nix store ≠ dev environment). `--no-profile` only skips dotfile/skill mounting.
-
-5. **Idempotency via `command -v zsh`** — Checking for zsh is a cheap proxy for "are personal tools installed?" Avoids running `nix profile install` on every boot (which would be slow even when cached).
+- The `container run --rm` with volume copy (`/busybox cp -a /mnt/src/. /mnt/env/`) works cleanly for seeding env volumes
+- `nix profile install /root --no-write-lock-file` is the correct incantation for flakes outside git repos
+- The entrypoint uses `command -v zsh` as a sentinel for "tools already installed" — this means if the golden volume already has zsh from a previous profile session, env tool install is skipped (correct behavior, tools are in the shared nix store)
+- Helix binary is `hx` not `helix` — minor, but worth knowing for tool verification
+- `env_vol_name()` function pattern keeps volume naming consistent: `agentenv-env-{name}`
 
 ---
 
 ## Tasks
 
 ### Current Focus
-- [x] Clean up: revert activate.sh to pure symlinks (remove all nix commands)
-- [x] Clean up: replace `homeConfigurations.portable` in ~/config/flake.nix with `packages.aarch64-linux.portable` (buildEnv with personal tools)
-- [x] Clean up: remove ~/config/nixpkgs/portable.nix (no longer needed)
-- [x] Write standalone dotfiles in ~/config/ that work without home-manager:
-  - `.config/zsh/.zshrc` — simple prompt, aliases (`ls=eza`, `vim=nvim`), `eval "$(zoxide init zsh)"`, `unsetopt correct`. (Skipped prezto — too complex without home-manager managing it)
-  - `.config/zsh/.zshenv` — set EDITOR=nvim, ZDOTDIR
-  - `.tmux.conf` — mouse on, 256color, keybinds (split/new-window inherit cwd). (Skipped catppuccin plugin — needs tpm or manual install)
-  - nvim config already exists as plain files (`.config/nvim/init.vim` + `lua/`) — no changes needed
-- [x] Update activate.sh to symlink the new standalone dotfiles (zsh, tmux) into place
-- [x] Update entrypoint.sh: if profile has flake.nix, run `nix profile install` for personal tools (idempotent, cached in golden volume). Set PATH to include `~/.nix-profile/bin` before shell detection.
-- [x] Stage all config changes with `git -C ~/config add` so nix can see them
-- [x] Get `agentenv .` to boot into zsh with personal tools on PATH
+- [x] Create `test-env/` directory with dotfiles and flake.nix. Use the existing standalone dotfiles from `~/config/.config/zsh/.zshrc`, `~/config/.tmux.conf`, etc. as reference. The flake.nix declares personal tools as a buildEnv (`packages.default`).
+- [x] Implement `agentenv env create <name> [dir]` — creates a named volume and copies directory contents into it via a temp container
+- [x] Implement `agentenv env list` — lists `agentenv-env-*` volumes
+- [x] Implement `agentenv env rm <name>` — deletes the volume
+- [x] Implement `--env <name>` flag on the container launch path — mounts the named volume at /root instead of using ephemeral home
+- [x] Simplify entrypoint.sh — remove profile/activate.sh handling. Check for ~/flake.nix, install tools if present, launch shell.
+- [x] Rebuild the container image after entrypoint changes
 
 ### Verify
-- [x] `which zsh && which nvim && which rg && which fd && which fzf && which jq && which eza && which zoxide` — all found
-- [x] Second boot is fast (2.8s — nix profile install skipped, golden volume cached)
-- [x] `agentenv --no-profile .` boots without dotfiles (personal tools still available via golden volume — correct per ontology)
-- [x] `agentenv . -- zsh -c 'which nvim'` works (non-interactive with profile)
-- [x] Dotfiles are live-editable: VirtioFS mount, symlinks point to profile dir
+- [x] `agentenv env create test ./test-env` creates the volume with dotfiles and flake.nix inside
+- [x] `agentenv --env test .` boots into zsh with personal tools on PATH (first boot: installs tools)
+- [x] Second boot of `agentenv --env test .` is fast (tools cached, no reinstall)
+- [x] `which zsh && which nvim && which rg && which fd && which fzf` — all found
+- [x] Shell history persists: run a command, exit, re-enter, press up arrow (verified via file persistence)
+- [x] Same env works on a different project: `agentenv --env test ~/projects/other-project` (if it has a flake.nix)
+- [x] `agentenv env list` shows the test environment
+- [x] `agentenv env rm test` deletes it
 
 ### Later
-- [ ] Neovim plugins (currently in portable.nix programs.neovim — need alternative approach)
-- [ ] Home-manager as optional layer on top (future session)
-- [ ] Update docs (portable-profiles.md, skill) to reflect new ontology
+- [ ] Default environment (auto-create on `agentenv .` if no --env specified?)
+- [ ] `agentenv env reset <name>` — recreate from original flake
+- [ ] Deprecate/remove --profile and activate.sh support
+- [ ] Update docs and skill for environment model
+- [ ] Skills inside environments (~/. claude/skills/)
 
 ---
 
 ## Instructions
 
-1. **Read context** — This file, `specs-portable/ontology.md`, progress-portable.txt if it exists
-2. **Pick the most important unchecked task** (not necessarily in order)
-3. **Implement it fully** — no placeholders
-4. **Stage changes** — `git -C ~/config add <file>` after modifying config repo files (nix flakes require tracked files)
-5. **Run and verify** — Test with `agentenv .` from `~/projects/agentenv/`
+1. **Read context** — This file, `specs/persistent-home.md`, existing `agentenv` script, existing `entrypoint.sh`
+2. **Read reference dotfiles** — `~/config/.config/zsh/.zshrc`, `~/config/.config/zsh/.zshenv`, `~/config/.tmux.conf` for the test-env
+3. **Pick the most important unchecked task** (not necessarily in order)
+4. **Implement it fully** — no placeholders
+5. **Test with `agentenv`** — Run commands to verify each step
 6. **Update** — Check off tasks, update State section
-7. **Commit** — In the appropriate repo for each change
+7. **Commit** — `git add -A && git commit -m "feat: <description>"`
 
-**Multi-repo work:**
-- Container infra: `~/projects/agentenv/` (entrypoint.sh, agentenv script)
-- Dev environment: `~/config/` (activate.sh, flake.nix)
+**Testing flow:**
+```bash
+# After implementing env create + --env:
+./agentenv env create test ./test-env
+./agentenv --env test .
+# Inside container: verify zsh, nvim, dotfiles, etc.
+# Exit, re-enter, verify state persists
+```
 
-**Testing:** Run `agentenv .` from `~/projects/agentenv/`. Container should drop into zsh with all personal tools available. If the container image needs rebuilding (entrypoint changes), run `container build -t agentenv ~/projects/agentenv/image/`.
+**Image rebuild:** After changing entrypoint.sh:
+```bash
+container build -t agentenv ~/projects/agentenv/image/
+```
 
-**Important:** After modifying files in `~/config/`, run `git -C ~/config add <file>` before testing — nix flakes only see git-tracked files.
+**Golden volume:** If nix store gets corrupted or stale, delete and let it re-bootstrap:
+```bash
+container volume rm nix-golden
+```
 
 ---
 
 ## Success Criteria
 
-- `agentenv .` boots into zsh with personal tools (neovim, ripgrep, fd, etc.)
-- Dotfiles are symlinked from the mounted profile
-- Clean separation: nix store has packages, dev environment has files
-- Second boot is fast
-- `--no-profile` gives bare devshell
+- `agentenv env create test ./test-env` works
+- `agentenv --env test .` boots into zsh with tools and dotfiles
+- State persists across reboots (shell history)
+- Same env works across different projects
+- `agentenv env list` and `agentenv env rm` work
+- Clean separation: environment = named volume (home), nix store = golden volume (packages)
 
 ---
 
