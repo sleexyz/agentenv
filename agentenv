@@ -206,7 +206,13 @@ unlink_skills() {
 
 # --- Subcommand: install ---
 cmd_install() {
-  local name="${1:-$(basename "$(pwd)")}"
+  local name="${1:-}"
+  # Resolve paths like "." or "./foo" to a proper name
+  if [ -z "$name" ] || [ "$name" = "." ]; then
+    name=$(basename "$(pwd)")
+  else
+    name=$(basename "$(cd "$name" 2>/dev/null && pwd || echo "$name")")
+  fi
   [ -d "$(pwd)" ] || die "current directory is not valid"
   mkdir -p "$INSTALLED_DIR"
   ln -sfn "$(pwd)" "$INSTALLED_DIR/$name"
