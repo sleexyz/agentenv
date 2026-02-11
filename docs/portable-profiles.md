@@ -1,105 +1,122 @@
-# Portable Profiles
+# Portable Dev Environments
 
-> Your personal dev environment, mounted wherever you are.
+> Your tools, your config, your skills — layered on top of any project.
 
-## The Idea
+## Three Primitives
 
-A portable profile is your `~/config` directory — dotfiles, editor config, shell setup, Claude skills — mounted into any dev environment. Local container, remote sandbox, new machine. Same path, same config, live and editable.
+agentenv composes three independent layers. Each is optional.
 
-The transport is an implementation detail:
+### 1. Nix Store (golden volume)
 
-| Environment | Transport | Editable? |
-|---|---|---|
-| Local container (agentenv) | VirtioFS | Yes |
-| Remote sandbox | Reverse SSHFS / Tailscale | Yes |
-| Offline / CI | `nix build` from flake URL | No (Nix store, immutable) |
+Package cache at `/nix`. Contains project devshell packages AND personal tools (via nix profile). COW-cloned from a golden ext4 image in ~2ms. Promoted back on exit (accumulates store paths). Rebuildable, disposable.
 
-## Architecture
+### 2. Dev Environment (profile directory)
 
-```
-agentenv --profile ~/config .
-  │
-  ├── /nix          ← COW clone of golden volume (packages, 2ms)
-  ├── ~/config      ← VirtioFS mount of host ~/config (live, editable)
-  ├── /work         ← VirtioFS mount of project dir (live, editable)
-  │
-  └── activate.sh   ← symlinks ~/config into the right places
-        ~/.config/nvim   → ~/config/.config/nvim
-        ~/.config/zsh    → ~/config/.config/zsh
-        ~/.claude/skills → ~/config/skills
-        ...
-```
+A directory of files — dotfiles, editor config, skills, memory. Mounted via VirtioFS at `/root/profile`. Live-editable from the host.
 
-The profile is **optional**. Without it, agentenv works exactly as it does today — bare `nix develop` shell. With it, you get your full personal dev environment layered on top.
+Has an `activate.sh` that symlinks files into place. Pure symlinks, no package management.
 
-## Two layers, independently optional
+May contain a `flake.nix` that declares personal tools — but those packages go into the nix store, not here.
+
+### 3. DevShell (project flake)
+
+Packages on PATH for a specific project. Declared in the project's `flake.nix`, instantiated by `nix develop`. Ephemeral, per-project.
+
+## How they compose
 
 ```
-Layer 0: agentenv (always)
-  - Nix store (COW clone of golden volume)
-  - Project mount (VirtioFS)
-  - nix develop
-
-Layer 1: profile (opt-in)
-  - ~/config mount (VirtioFS or network)
-  - Activation (symlinks dotfiles + skills)
-  - Shell, editor, tools — your full personal setup
+                    ┌─────────────────────────────┐
+                    │  Dev Environment (optional)  │  ~/config → /root/profile
+                    │  activate.sh: symlinks only  │  dotfiles, skills
+                    ├─────────────────────────────┤
+nix develop PATH →  │  DevShell (project)          │  project flake.nix
+                    ├─────────────────────────────┤
+~/.nix-profile/bin → │  Personal Tools (nix profile)│  declared in dev env flake
+                    ├─────────────────────────────┤
+                    │  Nix Store (golden volume)   │  /nix, COW-cloned
+                    └─────────────────────────────┘
 ```
 
-Deployment/CI uses layer 0 only. Development uses both.
+PATH inside the container = devshell packages + `~/.nix-profile/bin` (personal tools) + base paths.
+
+`nix develop` already includes `~/.nix-profile/bin` in PATH, so personal tools and project tools coexist without explicit composition.
+
+## Boot sequence
+
+```
+agentenv .
+  1. APFS COW clone golden volume → /nix                    (2ms)
+  2. Mount dev env: ~/config → /root/profile                (VirtioFS)
+  3. Mount project: cwd → /work                             (VirtioFS)
+  4. Entrypoint:
+     a. Seed /nix if empty                                  (first boot only)
+     b. If profile has flake: nix profile install tools     (first boot, then cached)
+     c. If profile has activate.sh: source it               (symlinks dotfiles)
+     d. nix develop /work --command zsh                     (or bash if no zsh)
+  5. On exit: promote golden volume                         (persist nix store)
+```
+
+First boot: ~3-4 min (downloads personal tools). Second boot: ~2.8s (cached).
 
 ## The Profile Directory
 
-A profile is any directory with an `activate.sh` at its root. The contract:
+A profile is any directory with an `activate.sh` at its root:
 
 ```
 ~/config/
-  activate.sh           # entry point: symlinks everything into place
+  activate.sh           # symlinks dotfiles + skills into place
   .config/
     nvim/               # neovim config (init.vim + lua/)
-    zsh/                # zsh config
+    zsh/                # zsh config (.zshrc, .zshenv)
     helix/              # helix config
-    git/                # git ignore, config
+    git/                # git ignore
+  .tmux.conf            # tmux config
   skills/               # Claude skills
-    polo/SKILL.md
-    frontend-design/SKILL.md
-    code-simplifier/SKILL.md
-    ...
-  flake.nix             # (optional) for offline/remote nix build fallback
-  nixpkgs/
-    portable.nix        # (optional) home-manager module for nix build path
+  flake.nix             # declares personal tools (buildEnv)
 ```
 
 ### activate.sh
 
-Runs inside the container after boot, before dropping into the shell. Creates symlinks from the mounted profile into the expected locations:
+Pure symlinks. No package management, no build steps.
 
 ```bash
 #!/bin/sh
-# ~/config/activate.sh — run inside a dev container
 PROFILE_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Dotfiles
 mkdir -p ~/.config
 ln -sfn "$PROFILE_DIR/.config/nvim" ~/.config/nvim
 ln -sfn "$PROFILE_DIR/.config/zsh" ~/.config/zsh
-ln -sfn "$PROFILE_DIR/.config/helix" ~/.config/helix
 ln -sfn "$PROFILE_DIR/.config/git" ~/.config/git
+ln -sfn "$PROFILE_DIR/.tmux.conf" ~/.tmux.conf
 
 # Claude skills
 mkdir -p ~/.claude/skills
 for skill in "$PROFILE_DIR/skills"/*/; do
-  name=$(basename "$skill")
-  ln -sfn "$skill" ~/.claude/skills/"$name"
+  [ -d "$skill" ] || continue
+  ln -sfn "$skill" ~/.claude/skills/"$(basename "$skill")"
 done
-
-# Custom scripts
-if [ -d "$PROFILE_DIR/.bin" ]; then
-  export PATH="$PROFILE_DIR/.bin:$PATH"
-fi
 ```
 
-### agentenv integration
+### Personal tools declaration
+
+In the profile's `flake.nix`, as a simple `packages` output:
+
+```nix
+packages.aarch64-linux.portable = let
+  pkgs = nixpkgs.legacyPackages.aarch64-linux;
+in pkgs.buildEnv {
+  name = "personal-tools";
+  paths = with pkgs; [ zsh neovim tmux ripgrep fd fzf jq eza zoxide ... ];
+};
+```
+
+Not home-manager. Just a package list. The entrypoint runs `nix profile install` from this on first boot.
+
+### Dotfiles are standalone
+
+Dotfiles are plain files, not generated by home-manager. Write a `.zshrc` that sets up your shell. Write a `.tmux.conf` with your keybinds. The dev environment is just files.
+
+## agentenv integration
 
 ```bash
 agentenv .                          # dev shell with personal profile (~/config)
@@ -107,122 +124,17 @@ agentenv --profile ~/other .       # override profile directory
 agentenv --no-profile .            # bare dev shell, no profile
 ```
 
-The profile defaults to `~/config`. Override with `--profile` or disable with `--no-profile`.
-
-## How It Works: Local Container
-
-```
-$ agentenv .
-
-1. Clone golden Nix volume (2ms)
-3. container run -it \
-     -v agentenv-$$:/nix \           # COW-cloned Nix store
-     -v .:/work \                # project (VirtioFS)
-     -v ~/config:~/config \      # profile (VirtioFS)
-     nix-dev \
-     sh -c "~/config/activate.sh && cd /work && nix develop"
-4. On exit: promote Nix volume → golden, cleanup
-```
-
-Total: ~2s to full personal dev shell.
-
-VirtioFS fd budget:
-- ~/config: 285 files → negligible
-- /work: project-sized → fine
-- /nix: NOT on VirtioFS (ext4 named volume) → zero fd pressure
-
-## How It Works: Remote Sandbox
-
-### With network mount (primary — live, editable)
-
-```
-# On remote sandbox (has Tailscale / SSH access to your Mac):
-$ sshfs you@your-mac.tail:~/config ~/config
-$ cd ~/project
-$ ~/config/activate.sh
-$ nix develop
-```
-
-Same `~/config` path, same activation, same result. Edits sync back to your Mac in real-time.
-
-### With Nix build (fallback — offline, immutable)
-
-If the config repo has a `homeConfigurations.portable` in its flake:
-
-```
-# On any machine with Nix:
-$ nix profile install github:you/config#homeConfigurations.portable.activationPackage
-$ nix develop
-```
-
-Dotfiles and tools are built from the flake and installed into the Nix profile. Not live-editable, but works offline and without network access to your Mac.
-
-## Skills Management
-
-Skills live in `~/config/skills/`. Each skill is a directory with a `SKILL.md`:
-
-```
-~/config/skills/
-  polo/SKILL.md
-  frontend-design/SKILL.md
-  code-simplifier/SKILL.md
-  skill-creator/SKILL.md
-  web-fetching/SKILL.md
-  marketing/SKILL.md
-  tmux-debug/SKILL.md
-  home-manager/SKILL.md
-```
-
-External skill repos (anthropic-skills, claude-plugins-official) can be git submodules under `~/config/skills/external/`, with the skills you use symlinked up:
-
-```
-~/config/skills/
-  external/
-    anthropic-skills/         # git submodule
-    claude-plugins-official/  # git submodule
-  frontend-design → external/anthropic-skills/skills/frontend-design
-  code-simplifier → external/claude-plugins-official/plugins/code-simplifier
-  polo/SKILL.md               # first-party, committed directly
-  web-fetching/SKILL.md       # first-party, committed directly
-  ...
-```
-
-activate.sh symlinks all of `~/config/skills/*` into `~/.claude/skills/`.
-
-## The Nix Fallback: portable.nix
-
-For offline/remote use, `~/config/flake.nix` exports a portable homeConfiguration:
-
-```nix
-homeConfigurations.portable = home-manager.lib.homeManagerConfiguration {
-  pkgs = nixpkgs.legacyPackages.aarch64-linux;
-  modules = [ ./nixpkgs/portable.nix ];
-};
-```
-
-`portable.nix` is a standalone home-manager module that includes the portable subset:
-- zsh + prezto + aliases
-- neovim + lua config + plugins
-- tmux + catppuccin
-- Core tools (ripgrep, fd, fzf, zoxide, eza, jq, atuin, htop, tree)
-- Git config
-- Claude skills (via `home.file.*.source`, copied into Nix store)
-
-It uses `home.file.*.source` (not `mkOutOfStoreSymlink`) so files are in the Nix store and work anywhere.
+Profile defaults to `~/config`. `--no-profile` skips mounting the profile (no dotfiles, no skills), but personal tools remain available if previously installed into the golden volume.
 
 ## What's NOT in the profile
 
 - Project-specific packages (those come from the project's flake.nix devShell)
 - Project-specific config (that's in the project repo)
-- Secrets (SSH keys, API tokens — separate concern, mounted individually or via agent forwarding)
-- macOS-specific services (Tailscale daemon, skhd, etc.)
+- Secrets (SSH keys, API tokens — separate concern)
+- macOS-specific services
 
-## Summary
+## What could layer on top (future)
 
-The portable profile is just a directory with an `activate.sh`. Mount it wherever you are. The transport (VirtioFS, SSHFS, Nix build) is an implementation detail. Your dev environment follows you.
-
-```
-Local:   ~/config mounted via VirtioFS  → 2s to full personal dev shell
-Remote:  ~/config mounted via SSHFS     → same activation, same result
-Offline: ~/config built via Nix flake   → immutable but works anywhere
-```
+- **Home-manager:** Could manage the dev environment declaratively. Optional.
+- **Remote transport:** SSHFS, Tailscale, nix build. Same primitives, different mount.
+- **Agent dispatch:** Same dev environment, shipped to a remote machine.

@@ -69,16 +69,21 @@ agentenv . -t -- htop               # force TTY for interactive commands
 
 ### How it works
 
-1. Golden volume holds a seeded Nix store (bootstrapped on first run)
-2. APFS COW clone creates an instant copy (~2ms)
-3. Profile activated: dotfiles symlinked, portable packages installed (first run only, persists in golden volume)
-4. Container runs with the clone mounted at `/nix` and the project at `/work`
-5. On exit, the clone is promoted back to golden (accumulates store paths)
-6. Temp volume is cleaned up
+Three independent layers compose at boot:
+
+1. **Nix store** — Golden volume COW-cloned (~2ms). Holds all packages.
+2. **Personal tools** — `nix profile install` from profile's `flake.nix` (first boot only, cached in golden volume). Provides zsh, neovim, tmux, ripgrep, etc.
+3. **Dev environment** — Profile directory (`~/config`) mounted via VirtioFS. `activate.sh` symlinks dotfiles and skills. Pure symlinks, no nix.
+4. **DevShell** — `nix develop` from project's `flake.nix`. Project-specific tools on PATH.
+5. On exit, golden volume promoted (persists nix store + personal tools).
+
+First boot: ~3-4 min (downloads personal tools). Subsequent: ~2.8s.
 
 ### Profile support
 
-Profile defaults to `~/config`. It must contain an `activate.sh` that sets up dotfiles and installs personal tools. The portable home-manager profile (`~/config#homeConfigurations.portable`) provides zsh, neovim, tmux, and core tools. Override with `--profile <dir>` or disable with `--no-profile`.
+Profile defaults to `~/config`. Must contain `activate.sh` (symlinks dotfiles) and optionally a `flake.nix` with a `packages.aarch64-linux.portable` output (personal tools as `buildEnv`). Override with `--profile <dir>` or disable with `--no-profile`.
+
+`--no-profile` skips dotfiles/skills but personal tools remain on PATH (they're in the nix store, not the profile).
 
 ### Installed repo mounts
 
