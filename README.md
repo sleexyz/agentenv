@@ -1,6 +1,6 @@
 # agentenv
 
-Portable dev environments for agents and humans. Dev shell in ~2s on macOS.
+Portable dev environments for agents and humans.
 
 ```
 $ agentenv .
