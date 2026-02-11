@@ -7,8 +7,7 @@ VOLUMES_DIR="$HOME/Library/Application Support/com.apple.container/volumes"
 GOLDEN_VOL="nix-golden"
 IMAGE="agentenv"
 TEMP_VOL="agentenv-$$"
-PROFILE_DIR=""
-CONFIG_FILE="$HOME/.config/agentenv/config.toml"
+PROFILE_DIR="$HOME/config"
 INSTALLED_DIR="$HOME/config/installed"
 BIN_DIR="$HOME/config/bin"
 SKILLS_DIR="$HOME/config/skills"
@@ -33,17 +32,13 @@ Commands:
   rewrap            Regenerate all host wrappers and skill links
 
 Options:
-  -p, --profile <dir>   Mount a profile directory (with activate.sh)
+  -p, --profile <dir>   Override profile directory (default: ~/config)
+  --no-profile          Launch without profile
   -t                    Force TTY allocation for non-interactive commands
   -h, --help            Show this help
 
-Configuration:
-  ~/.config/agentenv/config.toml
-    profile = "~/config"    # default profile directory
-
 Examples:
-  agentenv .                        # dev shell for current project
-  agentenv --profile ~/config .     # with personal profile
+  agentenv .                        # dev shell with personal profile
   agentenv test/basic/              # dev shell for test flake
   agentenv . -- make test           # run command, exit with its status
   agentenv . -- bash -c 'echo \$PATH'  # shell pipeline
@@ -277,19 +272,7 @@ case "${1:-}" in
   -h|--help) usage ;;
 esac
 
-# --- Parse config file ---
-read_config() {
-  if [ -f "$CONFIG_FILE" ]; then
-    local val
-    val=$(grep -E '^profile\s*=' "$CONFIG_FILE" 2>/dev/null | sed 's/^profile\s*=\s*"\?\(.*\)"\?\s*$/\1/' | sed 's/^~/'"${HOME//\//\\/}"'/' || true)
-    if [ -n "$val" ]; then
-      PROFILE_DIR="$val"
-    fi
-  fi
-}
-
 # --- Parse arguments ---
-read_config
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -297,6 +280,10 @@ while [ $# -gt 0 ]; do
       [ -n "${2:-}" ] || die "missing argument for $1"
       PROFILE_DIR="$2"
       shift 2
+      ;;
+    --no-profile)
+      PROFILE_DIR=""
+      shift
       ;;
     -t)
       FORCE_TTY=true
@@ -373,7 +360,7 @@ fi
 # --- Create temp volume + APFS clone ---
 container volume create "$TEMP_VOL" >/dev/null
 rm "$VOLUMES_DIR/$TEMP_VOL/volume.img"
-cp -c "$VOLUMES_DIR/$GOLDEN_VOL/volume.img" "$VOLUMES_DIR/$TEMP_VOL/volume.img"
+/bin/cp -c "$VOLUMES_DIR/$GOLDEN_VOL/volume.img" "$VOLUMES_DIR/$TEMP_VOL/volume.img"
 
 # --- Build container run command ---
 RUN_ARGS=(--rm -v "$TEMP_VOL:/nix" -v "$TARGET_DIR:/work")
@@ -394,15 +381,17 @@ if [ -n "$PROFILE_DIR" ]; then
   RUN_ARGS+=(-v "$PROFILE_DIR:/root/profile" -e "AGENTENV_PROFILE=/root/profile")
 fi
 
-# Mount installed repos
+# Mount installed repos (skip duplicates of already-mounted paths)
 if [ -d "$INSTALLED_DIR" ]; then
   for link in "$INSTALLED_DIR"/*; do
     [ -L "$link" ] || continue
     name=$(basename "$link")
     target=$(readlink -f "$link")
-    if [ -d "$target" ]; then
-      RUN_ARGS+=(-v "$target:/installed/$name")
-    fi
+    [ -d "$target" ] || continue
+    # Skip if this path is already mounted as /work or /root/profile
+    [ "$target" = "$TARGET_DIR" ] && continue
+    [ -n "$PROFILE_DIR" ] && [ "$target" = "$PROFILE_DIR" ] && continue
+    RUN_ARGS+=(-v "$target:/installed/$name")
   done
 fi
 
@@ -411,7 +400,7 @@ EXIT_CODE=0
 container run "${RUN_ARGS[@]}" "$IMAGE" "${CMD_ARGS[@]}" || EXIT_CODE=$?
 
 # --- Promote: clone temp back to golden ---
-cp -c "$VOLUMES_DIR/$TEMP_VOL/volume.img" "$VOLUMES_DIR/$GOLDEN_VOL/volume.img"
+/bin/cp -c "$VOLUMES_DIR/$TEMP_VOL/volume.img" "$VOLUMES_DIR/$GOLDEN_VOL/volume.img"
 
 # cleanup runs via trap
 exit "$EXIT_CODE"

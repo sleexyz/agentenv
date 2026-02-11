@@ -10,14 +10,14 @@ The transport is an implementation detail:
 
 | Environment | Transport | Editable? |
 |---|---|---|
-| Local container (ndev) | VirtioFS | Yes |
+| Local container (agentenv) | VirtioFS | Yes |
 | Remote sandbox | Reverse SSHFS / Tailscale | Yes |
 | Offline / CI | `nix build` from flake URL | No (Nix store, immutable) |
 
 ## Architecture
 
 ```
-ndev --profile ~/config .
+agentenv --profile ~/config .
   │
   ├── /nix          ← COW clone of golden volume (packages, 2ms)
   ├── ~/config      ← VirtioFS mount of host ~/config (live, editable)
@@ -30,12 +30,12 @@ ndev --profile ~/config .
         ...
 ```
 
-The profile is **optional**. Without it, ndev works exactly as it does today — bare `nix develop` shell. With it, you get your full personal dev environment layered on top.
+The profile is **optional**. Without it, agentenv works exactly as it does today — bare `nix develop` shell. With it, you get your full personal dev environment layered on top.
 
 ## Two layers, independently optional
 
 ```
-Layer 0: ndev (always)
+Layer 0: agentenv (always)
   - Nix store (COW clone of golden volume)
   - Project mount (VirtioFS)
   - nix develop
@@ -99,32 +99,24 @@ if [ -d "$PROFILE_DIR/.bin" ]; then
 fi
 ```
 
-### ndev integration
+### agentenv integration
 
 ```bash
-ndev .                          # no profile, bare dev shell
-ndev --profile ~/config .      # with profile
-ndev -p ~/config .             # shorthand
+agentenv .                          # dev shell with personal profile (~/config)
+agentenv --profile ~/other .       # override profile directory
+agentenv --no-profile .            # bare dev shell, no profile
 ```
 
-With a config file for the default:
-
-```toml
-# ~/.config/ndev/config.toml
-profile = "~/config"
-```
-
-Then just `ndev .` always brings your profile.
+The profile defaults to `~/config`. Override with `--profile` or disable with `--no-profile`.
 
 ## How It Works: Local Container
 
 ```
-$ ndev .
+$ agentenv .
 
-1. Read config: profile = ~/config
-2. Clone golden Nix volume (2ms)
+1. Clone golden Nix volume (2ms)
 3. container run -it \
-     -v ndev-$$:/nix \           # COW-cloned Nix store
+     -v agentenv-$$:/nix \           # COW-cloned Nix store
      -v .:/work \                # project (VirtioFS)
      -v ~/config:~/config \      # profile (VirtioFS)
      nix-dev \
@@ -218,24 +210,9 @@ homeConfigurations.portable = home-manager.lib.homeManagerConfiguration {
 
 It uses `home.file.*.source` (not `mkOutOfStoreSymlink`) so files are in the Nix store and work anywhere.
 
-## Configuration
-
-```toml
-# ~/.config/ndev/config.toml
-
-# Default profile directory (mounted into container)
-profile = "~/config"
-
-# Golden volume name
-golden = "nix-golden"
-
-# Container image
-image = "nix-dev"
-```
-
 ## What's NOT in the profile
 
-- Nix packages (those are in the golden Nix volume + project flake)
+- Project-specific packages (those come from the project's flake.nix devShell)
 - Project-specific config (that's in the project repo)
 - Secrets (SSH keys, API tokens — separate concern, mounted individually or via agent forwarding)
 - macOS-specific services (Tailscale daemon, skhd, etc.)

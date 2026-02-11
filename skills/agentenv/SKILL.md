@@ -59,8 +59,9 @@ Run `agentenv list` to see current state.
 Instant Nix dev shell via APFS copy-on-write volume cloning (~2s startup). Requires a `flake.nix` in the target directory.
 
 ```bash
-agentenv .                          # interactive dev shell for cwd
-agentenv --profile ~/config .       # with personal profile (dotfiles, editor)
+agentenv .                          # dev shell with personal profile (~config)
+agentenv --no-profile .             # bare dev shell, no profile
+agentenv --profile ~/other .        # override profile directory
 agentenv project/                   # dev shell for another directory
 agentenv . -- make test             # run command non-interactively, exit with its status
 agentenv . -t -- htop               # force TTY for interactive commands
@@ -70,13 +71,14 @@ agentenv . -t -- htop               # force TTY for interactive commands
 
 1. Golden volume holds a seeded Nix store (bootstrapped on first run)
 2. APFS COW clone creates an instant copy (~2ms)
-3. Container runs with the clone mounted at `/nix` and the project at `/work`
-4. On exit, the clone is promoted back to golden (accumulates store paths)
-5. Temp volume is cleaned up
+3. Profile activated: dotfiles symlinked, portable packages installed (first run only, persists in golden volume)
+4. Container runs with the clone mounted at `/nix` and the project at `/work`
+5. On exit, the clone is promoted back to golden (accumulates store paths)
+6. Temp volume is cleaned up
 
 ### Profile support
 
-A profile directory (default: `~/config`, configurable via `~/.config/agentenv/config.toml`) is mounted at `/root/profile`. It must contain an `activate.sh` that sets up dotfiles, editor config, etc.
+Profile defaults to `~/config`. It must contain an `activate.sh` that sets up dotfiles and installs personal tools. The portable home-manager profile (`~/config#homeConfigurations.portable`) provides zsh, neovim, tmux, and core tools. Override with `--profile <dir>` or disable with `--no-profile`.
 
 ### Installed repo mounts
 

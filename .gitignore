@@ -2,3 +2,9 @@
 bashes.log
 progress-*.txt
 .DS_Store
+
+# polo
+BLOCKING.md
+
+ralph-portable.log
+polo-portable.log
